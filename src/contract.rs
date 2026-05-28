@@ -1,6 +1,7 @@
+use alloc::{string::String as RustString, vec::Vec as RustVec};
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, Address, Bytes, BytesN, Env, String,
-    Symbol, Vec,
+    contract, contractimpl, contracttype, panic_with_error, symbol_short, Address,
+    Bytes, BytesN, Env, String, Symbol, Vec,
 };
 extern crate alloc;
 
@@ -64,6 +65,20 @@ pub struct AuditLog {
 #[derive(Clone)]
 pub struct RequestId {
     pub id: Bytes,
+    pub created_at: u64,
+}
+
+/// Carries the root request ID and the ordered chain of operation names
+/// performed under that root request. Every sub-operation appends its name
+/// to `operation_chain` rather than creating a new root ID.
+#[contracttype]
+#[derive(Clone)]
+pub struct RequestContext {
+    /// The root request ID that initiated this chain of operations.
+    pub root_request_id: RequestId,
+    /// Ordered list of operation names performed under this root request.
+    pub operation_chain: Vec<String>,
+    /// Ledger timestamp when this context was first created.
     pub created_at: u64,
 }
 
@@ -226,7 +241,7 @@ impl WeightedRoutingStrategy {
 // ---------------------------------------------------------------------------
 
 #[contracttype]
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Copy, Clone, Debug, PartialEq)]
 #[repr(u32)]
 pub enum KycStatus {
     NotSubmitted = 0,
@@ -408,6 +423,15 @@ struct TxStateChangedEvent {
     old_state: u32,
     new_state: u32,
     timestamp: u64,
+}
+
+#[contracttype]
+#[derive(Clone)]
+struct WebhookEvent {
+    event_type: String,
+    transaction_id: u64,
+    timestamp: u64,
+    payload_hash: Bytes,
 }
 
 // ---------------------------------------------------------------------------
@@ -661,11 +685,9 @@ impl AnchorKitContract {
 
         let hash = env.crypto().sha256(&input);
         let mut id = Bytes::new(&env);
-        // #230: hash.get(i) returns Option<u8>; use unwrap_or(0) — the SHA-256
-        // output is always 32 bytes so indices 0..16 are always present, but we
-        // use a safe accessor to avoid any theoretical panic.
-        for i in 0..16u32 {
-            id.push_back(hash.get(i).unwrap_or(0));
+        let hash_bytes = hash.to_array();
+        for b in hash_bytes.iter().take(16) {
+            id.push_back(*b);
         }
 
         RequestId { id, created_at: ts }
@@ -846,12 +868,10 @@ impl AnchorKitContract {
     pub fn set_endpoint(env: Env, attestor: Address, endpoint: String) {
         attestor.require_auth();
         Self::check_attestor(&env, &attestor);
-        if crate::validate_anchor_domain(endpoint.as_str()).is_err() {
-            panic_with_error!(&env, ErrorCode::InvalidEndpointFormat);
-        }
-        let xdr = attestor.clone().to_xdr(&env);
-        let raw = xdr_to_vec(&xdr);
-        let key = make_storage_key(&env, &[b"ENDPOINT", &raw]);
+        let endpoint_str = Self::soroban_string_to_rust_string(&env, &endpoint);
+        crate::validate_anchor_domain(&endpoint_str)
+            .unwrap_or_else(|_| panic_with_error!(&env, ErrorCode::InvalidEndpointFormat));
+        let key = (symbol_short!("ENDPOINT"), attestor.clone());
         env.storage().persistent().set(&key, &endpoint);
         env.storage().persistent().extend_ttl(&key, PERSISTENT_TTL, PERSISTENT_TTL);
         env.events().publish(
@@ -874,17 +894,18 @@ impl AnchorKitContract {
     pub fn register_webhook(env: Env, attestor: Address, webhook_url: String) {
         attestor.require_auth();
         Self::check_attestor(&env, &attestor);
-        if crate::validate_anchor_domain(webhook_url.as_str()).is_err() {
-            panic_with_error!(&env, ErrorCode::InvalidEndpointFormat);
-        }
-        let xdr = attestor.clone().to_xdr(&env);
-        let raw = xdr_to_vec(&xdr);
-        let key = make_storage_key(&env, &[b"WEBHOOK", &raw]);
+        let webhook_url_str = Self::soroban_string_to_rust_string(&env, &webhook_url);
+        crate::validate_anchor_domain(&webhook_url_str)
+            .unwrap_or_else(|_| panic_with_error!(&env, ErrorCode::InvalidEndpointFormat));
+        let key = (symbol_short!("WEBHOOK"), attestor.clone());
         env.storage().persistent().set(&key, &webhook_url);
         env.storage().persistent().extend_ttl(&key, PERSISTENT_TTL, PERSISTENT_TTL);
         env.events().publish(
-            (symbol_short!("webhook"), symbol_short!("registered")),
-            EndpointUpdated { attestor, endpoint: webhook_url },
+            (symbol_short!("webhook"), symbol_short!("reg")),
+            EndpointUpdated {
+                attestor,
+                endpoint: webhook_url,
+            },
         );
     }
 
@@ -998,7 +1019,7 @@ impl AnchorKitContract {
     // Attestation submission with KYC enforcement
     // -----------------------------------------------------------------------
 
-    pub fn submit_attestation_with_kyc_check(
+    pub fn submit_attestation_kyc_check(
         env: Env,
         issuer: Address,
         subject: Address,
@@ -1101,6 +1122,9 @@ impl AnchorKitContract {
             String::from_str(&env, "success"),
         );
 
+        // Propagate operation name into RequestContext
+        Self::record_operation_in_context(&env, &request_id.id, String::from_str(&env, "submit_attestation"));
+
         env.events().publish(
             (symbol_short!("attest"), symbol_short!("recorded"), id, subject),
             AttestEvent { payload_hash: payload_hash.clone(), timestamp },
@@ -1150,6 +1174,9 @@ impl AnchorKitContract {
             anchor, now,
             String::from_str(&env, "success"),
         );
+
+        // Propagate operation name into RequestContext
+        Self::record_operation_in_context(&env, &request_id.id, String::from_str(&env, "submit_quote"));
     }
 
     // -----------------------------------------------------------------------
@@ -1247,6 +1274,69 @@ impl AnchorKitContract {
         }
 
         spans
+    }
+
+    // -----------------------------------------------------------------------
+    // RequestContext — propagation and querying
+    // -----------------------------------------------------------------------
+
+    /// Create a new `RequestContext` for a root request ID.
+    ///
+    /// Stores the context in temporary storage keyed by the root request ID bytes
+    /// and returns it. The `operation_chain` starts empty; call
+    /// `append_operation` to record each sub-operation.
+    pub fn create_request_context(env: Env, root_request_id: RequestId) -> RequestContext {
+        let now = env.ledger().timestamp();
+        let ctx = RequestContext {
+            root_request_id: root_request_id.clone(),
+            operation_chain: Vec::new(&env),
+            created_at: now,
+        };
+        let key = (symbol_short!("REQCTX"), root_request_id.id.clone());
+        env.storage().temporary().set(&key, &ctx);
+        env.storage()
+            .temporary()
+            .extend_ttl(&key, SPAN_TTL, SPAN_TTL);
+        ctx
+    }
+
+    /// Append `operation_name` to the `operation_chain` of the context identified
+    /// by `root_request_id_bytes`. Creates the context if it does not yet exist.
+    pub fn append_operation(
+        env: Env,
+        root_request_id_bytes: Bytes,
+        operation_name: String,
+    ) {
+        let key = (symbol_short!("REQCTX"), root_request_id_bytes.clone());
+        let mut ctx: RequestContext = env
+            .storage()
+            .temporary()
+            .get(&key)
+            .unwrap_or_else(|| {
+                // Auto-create a minimal context if none exists yet
+                let now = env.ledger().timestamp();
+                RequestContext {
+                    root_request_id: RequestId {
+                        id: root_request_id_bytes.clone(),
+                        created_at: now,
+                    },
+                    operation_chain: Vec::new(&env),
+                    created_at: now,
+                }
+            });
+        ctx.operation_chain.push_back(operation_name);
+        env.storage().temporary().set(&key, &ctx);
+        env.storage()
+            .temporary()
+            .extend_ttl(&key, SPAN_TTL, SPAN_TTL);
+    }
+
+    /// Return the full `RequestContext` (including `operation_chain`) for a
+    /// given root request ID, or `None` if no context has been stored.
+    pub fn get_request_context(env: Env, root_request_id_bytes: Bytes) -> Option<RequestContext> {
+        env.storage()
+            .temporary()
+            .get::<_, RequestContext>(&(symbol_short!("REQCTX"), root_request_id_bytes))
     }
 
     // -----------------------------------------------------------------------
@@ -1425,7 +1515,7 @@ impl AnchorKitContract {
         env.storage().persistent().set(&key, &record);
         env.storage().persistent().extend_ttl(&key, PERSISTENT_TTL, PERSISTENT_TTL);
         env.events().publish(
-            (symbol_short!("compliance"), symbol_short!("checked"), subject),
+            (symbol_short!("comp"), symbol_short!("checked"), subject),
             record,
         );
     }
@@ -2216,7 +2306,7 @@ impl AnchorKitContract {
             reputation_weight: rw,
         };
         if !strategy.validate() {
-            panic_with_error!(&env, ErrorCode::InvalidWeights);
+            panic_with_error!(&env, ErrorCode::ValidationError);
         }
 
         let now = env.ledger().timestamp();
@@ -2505,6 +2595,16 @@ impl AnchorKitContract {
         }
     }
 
+    fn soroban_string_to_rust_string(env: &Env, value: &String) -> RustString {
+        let len = value.len() as usize;
+        let mut buffer = RustVec::new();
+        buffer.resize(len, 0u8);
+        value.copy_into_slice(&mut buffer);
+        RustString::from_utf8(buffer).unwrap_or_else(|_| {
+            panic_with_error!(env, ErrorCode::InvalidEndpointFormat)
+        })
+    }
+
     fn verify_attestation_signature(env: &Env, issuer: &Address, payload_hash: &Bytes, signature: &Bytes) {
         let xdr = issuer.clone().to_xdr(env);
         let raw = xdr_to_vec(&xdr);
@@ -2516,9 +2616,11 @@ impl AnchorKitContract {
         if signature.len() != 64 {
             panic_with_error!(env, ErrorCode::UnauthorizedAttestor);
         }
-        if !env.crypto().ed25519_verify(&pk, payload_hash, signature) {
-            panic_with_error!(env, ErrorCode::UnauthorizedAttestor);
-        }
+        let signature_bytes: BytesN<64> = signature.clone().try_into().unwrap_or_else(|_| {
+            panic_with_error!(env, ErrorCode::UnauthorizedAttestor)
+        });
+        env.crypto()
+            .ed25519_verify(&pk, payload_hash, &signature_bytes);
     }
 
     fn check_timestamp(env: &Env, timestamp: u64) {
@@ -2584,6 +2686,30 @@ impl AnchorKitContract {
         };
         let key = (symbol_short!("SPAN"), request_id.id.clone());
         env.storage().temporary().set(&key, &span);
+        env.storage()
+            .temporary()
+            .extend_ttl(&key, SPAN_TTL, SPAN_TTL);
+    }
+
+    /// Append `operation_name` to the `RequestContext` stored under `root_id_bytes`.
+    /// Creates a minimal context if none exists yet (e.g. for the root operation itself).
+    fn record_operation_in_context(env: &Env, root_id_bytes: &Bytes, operation_name: String) {
+        let key = (symbol_short!("REQCTX"), root_id_bytes.clone());
+        let now = env.ledger().timestamp();
+        let mut ctx: RequestContext = env
+            .storage()
+            .temporary()
+            .get(&key)
+            .unwrap_or_else(|| RequestContext {
+                root_request_id: RequestId {
+                    id: root_id_bytes.clone(),
+                    created_at: now,
+                },
+                operation_chain: Vec::new(env),
+                created_at: now,
+            });
+        ctx.operation_chain.push_back(operation_name);
+        env.storage().temporary().set(&key, &ctx);
         env.storage()
             .temporary()
             .extend_ttl(&key, SPAN_TTL, SPAN_TTL);
