@@ -51,6 +51,27 @@ For WASM output (Soroban deployment):
 cargo build --release --target wasm32-unknown-unknown --no-default-features --features wasm
 ```
 
+### Build Matrix
+
+SorobanAnchor supports two distinct build environments with complete feature separation:
+
+| Configuration | Command | Target | Output | CLI |
+|---|---|---|---|---|
+| **Native (default)** | `cargo build --release` | `x86_64-unknown-linux-gnu` | `target/release/anchorkit` | ✓ Yes |
+| **WASM/Soroban** | `cargo build --release --target wasm32-unknown-unknown --no-default-features --features wasm` | `wasm32-unknown-unknown` | `target/wasm32-unknown-unknown/release/anchorkit.wasm` | ✗ No |
+
+**Key differences:**
+- **Native**: Includes CLI, HTTP client (`reqwest`), filesystem access, and credential storage
+- **WASM**: Minimal runtime, no std library, only smart contract code for Soroban
+
+Both builds are verified by the automated test suite:
+
+```bash
+./scripts/test_build_matrix.sh
+```
+
+For detailed information about build paths, features, and environment separation, see [docs/build-matrix.md](docs/build-matrix.md).
+
 ## Testing
 
 ```bash
@@ -102,230 +123,100 @@ Anchor configs live in `configs/` as JSON or TOML. Validate them with:
 
 Schema reference: `config_schema.json`
 
-## Production Deployment
+## Integration Testing
 
-### Build artifacts
-
-```bash
-# Native CLI binary
-cargo build --release
-# Binary: target/release/anchorkit
-
-# WASM contract for Soroban
-cargo build --release --target wasm32-unknown-unknown --no-default-features --features wasm
-# Artifact: target/wasm32-unknown-unknown/release/anchorkit.wasm
-```
-
-### Pre-deployment checklist
-
-Run the automated validator first:
+The repository ships a CLI integration test harness that exercises the full
+deploy → initialize → register → attest → verify workflow using the Soroban
+local simulation environment (no network required by default).
 
 ```bash
-./scripts/pre_deploy_validate.sh
+# Run all integration harness tests (local simulation)
+cargo test --test cli_integration_harness
+
+# Or via Make
+make integration-test
 ```
 
-Then verify each item manually:
+The harness covers:
 
-- [ ] All configs in `configs/` pass schema validation (`./scripts/validate_all.sh`)
-- [ ] WASM binary builds cleanly with `--no-default-features --features wasm`
-- [ ] `cargo test` passes with no failures
-- [ ] Admin keypair is stored in the Stellar CLI keystore or encrypted with GPG/age (see `docs/secret-file-encryption.md`)
-- [ ] `ANCHOR_ADMIN_SECRET` is **not** set in shell history or CI logs
-- [ ] Contract ID is recorded in `.anchorkit/deployments.json` after deploy
-- [ ] Rate limits and session timeouts are set in your config file
-- [ ] Monitoring alerts are configured (see `configs/` `monitoring` block)
-- [ ] Webhook endpoints use HTTPS and are reachable from the contract host
+| Step | What is tested |
+|------|---------------|
+| 1 | Contract deployment and admin initialization |
+| 2 | Attestor registration (SEP-10 JWT flow) |
+| 3 | Service capability configuration |
+| 4 | Attestation submission and retrieval |
+| 5 | Session-based workflow with audit logging |
+| 6 | Quote submission and LowestFee routing |
+| 7 | Attestor revocation and cleanup |
+| E2E | Full pipeline in a single test |
+| 9 | KYC submit → approve workflow |
+| 10 | CLI binary smoke tests (`doctor`, `deploy --dry-run`) |
+| 11 | Live testnet smoke test (opt-in) |
 
-### WASM deployment to Soroban
+### Live testnet tests
+
+Set the following environment variables to run the live testnet step:
 
 ```bash
-# 1. Deploy contract (testnet)
-anchorkit deploy \
-  --network testnet \
-  --source anchor-admin \       # Stellar CLI keystore alias
-  --admin GADMIN_ADDRESS
+export SOROBAN_ANCHOR_INTEGRATION=testnet
+export ANCHOR_CONTRACT_ID=<deployed-contract-id>
+export ANCHOR_ADMIN_SECRET=<admin-secret-key>
 
-# 2. Record the contract ID printed by the deploy command, then initialize:
-export ANCHOR_CONTRACT_ID=CXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
-
-# 3. Register your first attestor
-anchorkit register \
-  --address GATTESTOR_ADDRESS \
-  --services deposits,withdrawals,kyc \
-  --contract-id "$ANCHOR_CONTRACT_ID" \
-  --network testnet \
-  --source anchor-admin \
-  --sep10-token <JWT> \
-  --sep10-issuer <ISSUER>
-
-# 4. Verify the deployment
-anchorkit doctor --network testnet
+make integration-test-live
 ```
 
-For mainnet, replace `--network testnet` with `--network mainnet` and use a hardware-backed or HSM-managed key as `--source`.
+## Release Packaging
 
-### Contract upgrade
+Production releases are built and bundled with a single Make target:
 
 ```bash
-anchorkit deploy \
-  --upgrade \
-  --contract-id "$ANCHOR_CONTRACT_ID" \
-  --network mainnet \
-  --source anchor-admin
+make release
 ```
 
-### Runtime configuration
+This runs `scripts/package_release.sh` which:
 
-Copy and edit one of the provided templates:
+1. Ensures the `wasm32-unknown-unknown` Rust target is installed.
+2. Builds the native CLI binary (`target/release/anchorkit`).
+3. Builds the optimized WASM contract (`target/wasm32-unknown-unknown/release/anchorkit.wasm`).
+4. Runs `wasm-opt -Oz` if binaryen is available.
+5. Assembles a bundle directory under `dist/anchorkit-<VERSION>/` containing:
+   - `anchorkit` — CLI binary
+   - `anchorkit.wasm` — Soroban WASM contract
+   - `schemas/config_schema.json` — JSON schema for anchor configs
+   - `configs/` — Example anchor configurations (JSON + TOML)
+   - `docs/` — Documentation
+   - `README.md`, `LICENSE`, `VERSION`
+6. Creates `dist/anchorkit-<VERSION>.tar.gz`.
+7. Generates a SHA-256 checksum file.
+
+### Validating the bundle
 
 ```bash
-cp configs/fiat-on-off-ramp.toml my-anchor.toml
-# Edit: contract.network, contract.admin_address, attestors.registry
+make release-validate
+# or directly:
+./scripts/validate_bundle.sh dist/anchorkit-0.1.0.tar.gz
 ```
 
-Key fields to set before going live:
+The validation script checks that all required artifacts are present and that
+JSON files are well-formed.
 
-| Field | Purpose |
-|-------|---------|
-| `contract.network` | `mainnet` or `testnet` |
-| `contract.admin_address` | Your admin Stellar address |
-| `attestors.registry[].address` | Attestor public keys |
-| `security.rate_limit_per_minute` | Per-attestor rate cap |
-| `sessions.session_timeout_seconds` | Session TTL |
-| `monitoring.alert_email` | Ops alert destination |
-
----
-
-## Security controls
-
-### Secret management
-
-Never pass secret keys as CLI arguments in production. Use one of:
-
-1. **Stellar CLI keystore** (recommended) — keys encrypted with a passphrase, never written to disk in plaintext:
-   ```bash
-   stellar keys add anchor-admin --secret-key
-   anchorkit deploy --source anchor-admin --network mainnet
-   ```
-
-2. **Encrypted keypair file** — GPG or age encryption, decrypted to a RAM-backed path at runtime:
-   ```bash
-   gpg --decrypt --output /dev/shm/keypair.json keypair.json.gpg
-   anchorkit register --keypair-file /dev/shm/keypair.json ...
-   shred -u /dev/shm/keypair.json
-   ```
-
-3. **Encrypted credential store** — AES-256-GCM keystore managed by the CLI:
-   ```bash
-   anchorkit credentials add --name anchor-admin-key
-   anchorkit register --credential-name anchor-admin-key ...
-   ```
-
-See `docs/secret-file-encryption.md` for full guidance including CI/CD patterns.
-
-### Key rotation
+### Cleaning up
 
 ```bash
-# 1. Generate a new keypair and store it
-stellar keys add anchor-admin-v2 --secret-key
-
-# 2. Update the admin on-chain (requires current admin signature)
-anchorkit deploy --upgrade --source anchor-admin --network mainnet
-
-# 3. Revoke the old attestor if the key was used as one
-anchorkit revoke \
-  --address GOLD_ATTESTOR_ADDRESS \
-  --contract-id "$ANCHOR_CONTRACT_ID" \
-  --source anchor-admin-v2 \
-  --network mainnet
-
-# 4. Remove the old key from the keystore
-stellar keys remove anchor-admin
+make clean-dist   # removes dist/
 ```
 
-Rotate keys immediately if a secret key is ever exposed in logs, shell history, or version control.
+## Governance and Security
 
-### Replay attack protection
+SorobanAnchor follows a documented governance and security model covering:
 
-Every attestation is keyed on `(issuer, payload_hash)` with a 7-day TTL. Duplicate submissions return error code 6 (`ReplayAttack`). Ensure your payload hashes are unique per operation — use `contract.generate_request_id()` to derive them deterministically.
+- **Roles** — Maintainers, Contributors, Security Reviewers, and on-chain Attestors.
+- **Contract upgrades** — Require two maintainer approvals, a reproducible WASM build, and a published SHA-256 checksum. Only the admin address recorded at contract initialization may authorize upgrades.
+- **Admin key management** — Multi-signature setup (2-of-N); keys are never committed to the repository; mainnet keys are stored on offline hardware wallets.
+- **Dependency auditing** — `cargo audit` runs in CI on every PR; all dependencies are pinned to exact versions and `Cargo.lock` is committed.
+- **Responsible disclosure** — Report vulnerabilities privately via GitHub's security advisory feature. We follow coordinated disclosure with a 14-day fix window.
 
-### Rate limiting
-
-Per-attestor sliding-window limits are enforced on-chain. Configure the cap in your config file:
-
-```toml
-[security]
-rate_limit_per_minute = 60
-```
-
-Exceeding the limit returns error code 16 (`RateLimitExceeded`). Back off and retry after the window resets.
-
-### Domain validation
-
-All anchor endpoints are validated as HTTPS-only before any outbound request. HTTP endpoints are rejected with error code 12 (`InvalidEndpointFormat`). Never register an anchor with an HTTP endpoint in production.
-
-### Monitoring
-
-Enable structured logging and set up alerts on these signals:
-
-- `RateLimitExceeded` (code 16) — possible abuse or misconfigured client
-- `ReplayAttack` (code 6) — potential replay attack in progress
-- `KycRejected` (code 21) — compliance event requiring review
-- `WebhookDeliveryFailed` (code 22) — downstream integration issue
-- `SessionExpired` (code 25) — clients not refreshing sessions
-
-The `static/status-monitor.html` and `static/webhook_monitor.html` dashboards provide a browser-based view of live anchor and webhook status.
-
-Full error code reference: `docs/error-codes.md`
-Gas and storage cost guide: `docs/gas-and-storage-costs.md`
-
----
-
-## Examples
-
-| File | What it shows |
-|------|--------------|
-| `examples/cli_example.sh` | Full deposit/withdrawal workflow |
-| `examples/anchor_info_discovery.sh` | Fetch anchor metadata and validate amounts |
-| `examples/anchor_routing_example.sh` | Multi-anchor routing strategies |
-| `examples/credential_management.sh` | Encrypted credential storage |
-| `examples/kyc_workflow.sh` | End-to-end KYC lifecycle |
-| `examples/attestation_workflow.sh` | Attestation submission and verification |
-| `examples/mock_mode_example.sh` | Testing without live anchors |
-| `examples/logging_demo.sh` | Logging configuration |
-
-Run any shell example directly:
-
-```bash
-bash examples/kyc_workflow.sh
-```
-
-Rust examples:
-
-```bash
-cargo run --example logging_example
-cargo run --example domain_validation_example
-```
-
----
-
-## Storybook (UI components)
-
-The `storybook/` directory contains standalone HTML component previews. Open them in any browser — no build step required:
-
-```bash
-open storybook/index.html
-```
-
-To verify all pages load without broken links:
-
-```bash
-./scripts/validate_storybook.sh
-```
-
-To regenerate or update a component, edit the corresponding `.html` file in `storybook/` directly. Each file is self-contained with inline styles and scripts.
-
----
+Full details: [`docs/governance-and-security.md`](docs/governance-and-security.md)
 
 ## License
 
